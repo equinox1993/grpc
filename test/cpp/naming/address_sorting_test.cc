@@ -36,10 +36,10 @@
 #include "src/core/ext/filters/client_channel/client_channel.h"
 #include "src/core/ext/filters/client_channel/resolver.h"
 #include "src/core/ext/filters/client_channel/resolver/dns/c_ares/grpc_ares_wrapper.h"
+#include "src/core/ext/filters/client_channel/resolver/dns/dns_resolver_selection.h"
 #include "src/core/ext/filters/client_channel/resolver_registry.h"
 #include "src/core/ext/filters/client_channel/server_address.h"
 #include "src/core/lib/channel/channel_args.h"
-#include "src/core/lib/gpr/env.h"
 #include "src/core/lib/gpr/host_port.h"
 #include "src/core/lib/gpr/string.h"
 #include "src/core/lib/iomgr/combiner.h"
@@ -52,6 +52,7 @@
 
 #ifndef GPR_WINDOWS
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #endif
 
@@ -790,7 +791,7 @@ TEST_F(AddressSortingTest, TestPrefersIpv6LoopbackInputsFlipped) {
 /* Try to rule out false positives in the above two tests in which
  * the sorter might think that neither ipv6 or ipv4 loopback is
  * available, but ipv6 loopback is still preferred only due
- * to precedance table lookups. */
+ * to precedence table lookups. */
 TEST_F(AddressSortingTest, TestSorterKnowsIpv6LoopbackIsAvailable) {
   sockaddr_in6 ipv6_loopback;
   memset(&ipv6_loopback, 0, sizeof(ipv6_loopback));
@@ -828,13 +829,13 @@ TEST_F(AddressSortingTest, TestSorterKnowsIpv6LoopbackIsAvailable) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  char* resolver = gpr_getenv("GRPC_DNS_RESOLVER");
-  if (resolver == nullptr || strlen(resolver) == 0) {
-    gpr_setenv("GRPC_DNS_RESOLVER", "ares");
-  } else if (strcmp("ares", resolver)) {
-    gpr_log(GPR_INFO, "GRPC_DNS_RESOLVER != ares: %s.", resolver);
+  grpc_core::UniquePtr<char> resolver =
+      GPR_GLOBAL_CONFIG_GET(grpc_dns_resolver);
+  if (strlen(resolver.get()) == 0) {
+    GPR_GLOBAL_CONFIG_SET(grpc_dns_resolver, "ares");
+  } else if (strcmp("ares", resolver.get())) {
+    gpr_log(GPR_INFO, "GRPC_DNS_RESOLVER != ares: %s.", resolver.get());
   }
-  gpr_free(resolver);
   grpc::testing::TestEnvironment env(argc, argv);
   ::testing::InitGoogleTest(&argc, argv);
   auto result = RUN_ALL_TESTS();

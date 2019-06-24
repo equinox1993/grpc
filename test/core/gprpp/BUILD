@@ -29,11 +29,50 @@ grpc_cc_test(
 )
 
 grpc_cc_test(
+    name = "global_config_test",
+    srcs = ["global_config_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    language = "C++",
+    deps = [
+        "//:gpr",
+        "//test/core/util:grpc_test_util",
+    ],
+)
+
+grpc_cc_test(
+    name = "global_config_env_test",
+    srcs = ["global_config_env_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    language = "C++",
+    deps = [
+        "//:gpr",
+        "//test/core/util:grpc_test_util",
+    ],
+)
+
+grpc_cc_test(
     name = "manual_constructor_test",
     srcs = ["manual_constructor_test.cc"],
     language = "C++",
     deps = [
         "//:gpr",
+        "//test/core/util:grpc_test_util",
+    ],
+)
+
+grpc_cc_test(
+    name = "grpc_core_map_test",
+    srcs = ["map_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    language = "C++",
+    deps = [
+        "//:gpr_base",
         "//test/core/util:grpc_test_util",
     ],
 )

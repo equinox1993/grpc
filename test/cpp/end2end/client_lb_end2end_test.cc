@@ -33,16 +33,17 @@
 #include <grpcpp/client_context.h>
 #include <grpcpp/create_channel.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <grpcpp/impl/codegen/sync.h>
 #include <grpcpp/server.h>
 #include <grpcpp/server_builder.h>
 
+#include "src/core/ext/filters/client_channel/backup_poller.h"
 #include "src/core/ext/filters/client_channel/global_subchannel_pool.h"
 #include "src/core/ext/filters/client_channel/parse_address.h"
 #include "src/core/ext/filters/client_channel/resolver/fake/fake_resolver.h"
 #include "src/core/ext/filters/client_channel/server_address.h"
 #include "src/core/lib/backoff/backoff.h"
 #include "src/core/lib/channel/channel_args.h"
-#include "src/core/lib/gpr/env.h"
 #include "src/core/lib/gprpp/debug_location.h"
 #include "src/core/lib/gprpp/ref_counted_ptr.h"
 #include "src/core/lib/iomgr/tcp_client.h"
@@ -56,6 +57,7 @@
 #include "test/core/util/test_lb_policies.h"
 #include "test/cpp/end2end/test_service_impl.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 using grpc::testing::EchoRequest;
@@ -97,7 +99,7 @@ class MyTestServiceImpl : public TestServiceImpl {
   Status Echo(ServerContext* context, const EchoRequest* request,
               EchoResponse* response) override {
     {
-      std::unique_lock<std::mutex> lock(mu_);
+      grpc::internal::MutexLock lock(&mu_);
       ++request_count_;
     }
     AddClient(context->peer());
@@ -105,29 +107,29 @@ class MyTestServiceImpl : public TestServiceImpl {
   }
 
   int request_count() {
-    std::unique_lock<std::mutex> lock(mu_);
+    grpc::internal::MutexLock lock(&mu_);
     return request_count_;
   }
 
   void ResetCounters() {
-    std::unique_lock<std::mutex> lock(mu_);
+    grpc::internal::MutexLock lock(&mu_);
     request_count_ = 0;
   }
 
   std::set<grpc::string> clients() {
-    std::unique_lock<std::mutex> lock(clients_mu_);
+    grpc::internal::MutexLock lock(&clients_mu_);
     return clients_;
   }
 
  private:
   void AddClient(const grpc::string& client) {
-    std::unique_lock<std::mutex> lock(clients_mu_);
+    grpc::internal::MutexLock lock(&clients_mu_);
     clients_.insert(client);
   }
 
-  std::mutex mu_;
+  grpc::internal::Mutex mu_;
   int request_count_;
-  std::mutex clients_mu_;
+  grpc::internal::Mutex clients_mu_;
   std::set<grpc::string> clients_;
 };
 
@@ -137,11 +139,7 @@ class ClientLbEnd2endTest : public ::testing::Test {
       : server_host_("localhost"),
         kRequestMessage_("Live long and prosper."),
         creds_(new SecureChannelCredentials(
-            grpc_fake_transport_security_credentials_create())) {
-    // Make the backup poller poll very frequently in order to pick up
-    // updates from all the subchannels's FDs.
-    gpr_setenv("GRPC_CLIENT_CHANNEL_BACKUP_POLL_INTERVAL_MS", "1");
-  }
+            grpc_fake_transport_security_credentials_create())) {}
 
   void SetUp() override {
     grpc_init();
@@ -153,7 +151,13 @@ class ClientLbEnd2endTest : public ::testing::Test {
     for (size_t i = 0; i < servers_.size(); ++i) {
       servers_[i]->Shutdown();
     }
-    grpc_shutdown();
+    // Explicitly destroy all the members so that we can make sure grpc_shutdown
+    // has finished by the end of this function, and thus all the registered
+    // LB policy factories are removed.
+    stub_.reset();
+    servers_.clear();
+    creds_.reset();
+    grpc_shutdown_blocking();
   }
 
   void CreateServers(size_t num_servers,
@@ -176,8 +180,8 @@ class ClientLbEnd2endTest : public ::testing::Test {
     }
   }
 
-  grpc_channel_args* BuildFakeResults(const std::vector<int>& ports) {
-    grpc_core::ServerAddressList addresses;
+  grpc_core::Resolver::Result BuildFakeResults(const std::vector<int>& ports) {
+    grpc_core::Resolver::Result result;
     for (const int& port : ports) {
       char* lb_uri_str;
       gpr_asprintf(&lb_uri_str, "ipv4:127.0.0.1:%d", port);
@@ -185,29 +189,22 @@ class ClientLbEnd2endTest : public ::testing::Test {
       GPR_ASSERT(lb_uri != nullptr);
       grpc_resolved_address address;
       GPR_ASSERT(grpc_parse_uri(lb_uri, &address));
-      addresses.emplace_back(address.addr, address.len, nullptr /* args */);
+      result.addresses.emplace_back(address.addr, address.len,
+                                    nullptr /* args */);
       grpc_uri_destroy(lb_uri);
       gpr_free(lb_uri_str);
     }
-    const grpc_arg fake_addresses =
-        CreateServerAddressListChannelArg(&addresses);
-    grpc_channel_args* fake_results =
-        grpc_channel_args_copy_and_add(nullptr, &fake_addresses, 1);
-    return fake_results;
+    return result;
   }
 
   void SetNextResolution(const std::vector<int>& ports) {
     grpc_core::ExecCtx exec_ctx;
-    grpc_channel_args* fake_results = BuildFakeResults(ports);
-    response_generator_->SetResponse(fake_results);
-    grpc_channel_args_destroy(fake_results);
+    response_generator_->SetResponse(BuildFakeResults(ports));
   }
 
   void SetNextResolutionUponError(const std::vector<int>& ports) {
     grpc_core::ExecCtx exec_ctx;
-    grpc_channel_args* fake_results = BuildFakeResults(ports);
-    response_generator_->SetReresolutionResponse(fake_results);
-    grpc_channel_args_destroy(fake_results);
+    response_generator_->SetReresolutionResponse(BuildFakeResults(ports));
   }
 
   void SetFailureOnReresolution() {
@@ -215,9 +212,11 @@ class ClientLbEnd2endTest : public ::testing::Test {
     response_generator_->SetFailureOnReresolution();
   }
 
-  std::vector<int> GetServersPorts() {
+  std::vector<int> GetServersPorts(size_t start_index = 0) {
     std::vector<int> ports;
-    for (const auto& server : servers_) ports.push_back(server->port_);
+    for (size_t i = start_index; i < servers_.size(); ++i) {
+      ports.push_back(servers_[i]->port_);
+    }
     return ports;
   }
 
@@ -234,7 +233,7 @@ class ClientLbEnd2endTest : public ::testing::Test {
     }  // else, default to pick first
     args.SetPointer(GRPC_ARG_FAKE_RESOLVER_RESPONSE_GENERATOR,
                     response_generator_.get());
-    return CreateCustomChannel("fake:///", creds_, args);
+    return ::grpc::CreateCustomChannel("fake:///", creds_, args);
   }
 
   bool SendRpc(
@@ -291,18 +290,18 @@ class ClientLbEnd2endTest : public ::testing::Test {
     void Start(const grpc::string& server_host) {
       gpr_log(GPR_INFO, "starting server on port %d", port_);
       started_ = true;
-      std::mutex mu;
-      std::unique_lock<std::mutex> lock(mu);
-      std::condition_variable cond;
+      grpc::internal::Mutex mu;
+      grpc::internal::MutexLock lock(&mu);
+      grpc::internal::CondVar cond;
       thread_.reset(new std::thread(
           std::bind(&ServerData::Serve, this, server_host, &mu, &cond)));
-      cond.wait(lock, [this] { return server_ready_; });
+      cond.WaitUntil(&mu, [this] { return server_ready_; });
       server_ready_ = false;
       gpr_log(GPR_INFO, "server startup complete");
     }
 
-    void Serve(const grpc::string& server_host, std::mutex* mu,
-               std::condition_variable* cond) {
+    void Serve(const grpc::string& server_host, grpc::internal::Mutex* mu,
+               grpc::internal::CondVar* cond) {
       std::ostringstream server_address;
       server_address << server_host << ":" << port_;
       ServerBuilder builder;
@@ -311,9 +310,9 @@ class ClientLbEnd2endTest : public ::testing::Test {
       builder.AddListeningPort(server_address.str(), std::move(creds));
       builder.RegisterService(&service_);
       server_ = builder.BuildAndStart();
-      std::lock_guard<std::mutex> lock(*mu);
+      grpc::internal::MutexLock lock(mu);
       server_ready_ = true;
-      cond->notify_one();
+      cond->Signal();
     }
 
     void Shutdown() {
@@ -401,6 +400,27 @@ class ClientLbEnd2endTest : public ::testing::Test {
   const grpc::string kRequestMessage_;
   std::shared_ptr<ChannelCredentials> creds_;
 };
+
+TEST_F(ClientLbEnd2endTest, ChannelStateConnectingWhenResolving) {
+  const int kNumServers = 3;
+  StartServers(kNumServers);
+  auto channel = BuildChannel("");
+  auto stub = BuildStub(channel);
+  // Initial state should be IDLE.
+  EXPECT_EQ(channel->GetState(false /* try_to_connect */), GRPC_CHANNEL_IDLE);
+  // Tell the channel to try to connect.
+  // Note that this call also returns IDLE, since the state change has
+  // not yet occurred; it just gets triggered by this call.
+  EXPECT_EQ(channel->GetState(true /* try_to_connect */), GRPC_CHANNEL_IDLE);
+  // Now that the channel is trying to connect, we should be in state
+  // CONNECTING.
+  EXPECT_EQ(channel->GetState(false /* try_to_connect */),
+            GRPC_CHANNEL_CONNECTING);
+  // Return a resolver result, which allows the connection attempt to proceed.
+  SetNextResolution(GetServersPorts());
+  // We should eventually transition into state READY.
+  EXPECT_TRUE(WaitForChannelReady(channel.get()));
+}
 
 TEST_F(ClientLbEnd2endTest, PickFirst) {
   // Start servers and send one RPC per server.
@@ -870,6 +890,79 @@ TEST_F(ClientLbEnd2endTest, PickFirstIdleOnDisconnect) {
   servers_.clear();
 }
 
+TEST_F(ClientLbEnd2endTest, PickFirstPendingUpdateAndSelectedSubchannelFails) {
+  auto channel = BuildChannel("");  // pick_first is the default.
+  auto stub = BuildStub(channel);
+  // Create a number of servers, but only start 1 of them.
+  CreateServers(10);
+  StartServer(0);
+  // Initially resolve to first server and make sure it connects.
+  gpr_log(GPR_INFO, "Phase 1: Connect to first server.");
+  SetNextResolution({servers_[0]->port_});
+  CheckRpcSendOk(stub, DEBUG_LOCATION, true /* wait_for_ready */);
+  EXPECT_EQ(channel->GetState(false), GRPC_CHANNEL_READY);
+  // Send a resolution update with the remaining servers, none of which are
+  // running yet, so the update will stay pending.  Note that it's important
+  // to have multiple servers here, or else the test will be flaky; with only
+  // one server, the pending subchannel list has already gone into
+  // TRANSIENT_FAILURE due to hitting the end of the list by the time we
+  // check the state.
+  gpr_log(GPR_INFO,
+          "Phase 2: Resolver update pointing to remaining "
+          "(not started) servers.");
+  SetNextResolution(GetServersPorts(1 /* start_index */));
+  // RPCs will continue to be sent to the first server.
+  CheckRpcSendOk(stub, DEBUG_LOCATION);
+  // Now stop the first server, so that the current subchannel list
+  // fails.  This should cause us to immediately swap over to the
+  // pending list, even though it's not yet connected.  The state should
+  // be set to CONNECTING, since that's what the pending subchannel list
+  // was doing when we swapped over.
+  gpr_log(GPR_INFO, "Phase 3: Stopping first server.");
+  servers_[0]->Shutdown();
+  WaitForChannelNotReady(channel.get());
+  // TODO(roth): This should always return CONNECTING, but it's flaky
+  // between that and TRANSIENT_FAILURE.  I suspect that this problem
+  // will go away once we move the backoff code out of the subchannel
+  // and into the LB policies.
+  EXPECT_THAT(channel->GetState(false),
+              ::testing::AnyOf(GRPC_CHANNEL_CONNECTING,
+                               GRPC_CHANNEL_TRANSIENT_FAILURE));
+  // Now start the second server.
+  gpr_log(GPR_INFO, "Phase 4: Starting second server.");
+  StartServer(1);
+  // The channel should go to READY state and RPCs should go to the
+  // second server.
+  WaitForChannelReady(channel.get());
+  WaitForServer(stub, 1, DEBUG_LOCATION, true /* ignore_failure */);
+}
+
+TEST_F(ClientLbEnd2endTest, PickFirstStaysIdleUponEmptyUpdate) {
+  // Start server, send RPC, and make sure channel is READY.
+  const int kNumServers = 1;
+  StartServers(kNumServers);
+  auto channel = BuildChannel("");  // pick_first is the default.
+  auto stub = BuildStub(channel);
+  SetNextResolution(GetServersPorts());
+  CheckRpcSendOk(stub, DEBUG_LOCATION);
+  EXPECT_EQ(channel->GetState(false), GRPC_CHANNEL_READY);
+  // Stop server.  Channel should go into state IDLE.
+  servers_[0]->Shutdown();
+  EXPECT_TRUE(WaitForChannelNotReady(channel.get()));
+  EXPECT_EQ(channel->GetState(false), GRPC_CHANNEL_IDLE);
+  // Now send resolver update that includes no addresses.  Channel
+  // should stay in state IDLE.
+  SetNextResolution({});
+  EXPECT_FALSE(channel->WaitForStateChange(
+      GRPC_CHANNEL_IDLE, grpc_timeout_seconds_to_deadline(3)));
+  // Now bring the backend back up and send a non-empty resolver update,
+  // and then try to send an RPC.  Channel should go back into state READY.
+  StartServer(0);
+  SetNextResolution(GetServersPorts());
+  CheckRpcSendOk(stub, DEBUG_LOCATION);
+  EXPECT_EQ(channel->GetState(false), GRPC_CHANNEL_READY);
+}
+
 TEST_F(ClientLbEnd2endTest, RoundRobin) {
   // Start servers and send one RPC per server.
   const int kNumServers = 3;
@@ -922,8 +1015,8 @@ TEST_F(ClientLbEnd2endTest, RoundRobinUpdates) {
   auto channel = BuildChannel("round_robin");
   auto stub = BuildStub(channel);
   std::vector<int> ports;
-
   // Start with a single server.
+  gpr_log(GPR_INFO, "*** FIRST BACKEND ***");
   ports.emplace_back(servers_[0]->port_);
   SetNextResolution(ports);
   WaitForServer(stub, 0, DEBUG_LOCATION);
@@ -933,36 +1026,33 @@ TEST_F(ClientLbEnd2endTest, RoundRobinUpdates) {
   EXPECT_EQ(0, servers_[1]->service_.request_count());
   EXPECT_EQ(0, servers_[2]->service_.request_count());
   servers_[0]->service_.ResetCounters();
-
   // And now for the second server.
+  gpr_log(GPR_INFO, "*** SECOND BACKEND ***");
   ports.clear();
   ports.emplace_back(servers_[1]->port_);
   SetNextResolution(ports);
-
   // Wait until update has been processed, as signaled by the second backend
   // receiving a request.
   EXPECT_EQ(0, servers_[1]->service_.request_count());
   WaitForServer(stub, 1, DEBUG_LOCATION);
-
   for (size_t i = 0; i < 10; ++i) CheckRpcSendOk(stub, DEBUG_LOCATION);
   EXPECT_EQ(0, servers_[0]->service_.request_count());
   EXPECT_EQ(10, servers_[1]->service_.request_count());
   EXPECT_EQ(0, servers_[2]->service_.request_count());
   servers_[1]->service_.ResetCounters();
-
   // ... and for the last server.
+  gpr_log(GPR_INFO, "*** THIRD BACKEND ***");
   ports.clear();
   ports.emplace_back(servers_[2]->port_);
   SetNextResolution(ports);
   WaitForServer(stub, 2, DEBUG_LOCATION);
-
   for (size_t i = 0; i < 10; ++i) CheckRpcSendOk(stub, DEBUG_LOCATION);
   EXPECT_EQ(0, servers_[0]->service_.request_count());
   EXPECT_EQ(0, servers_[1]->service_.request_count());
   EXPECT_EQ(10, servers_[2]->service_.request_count());
   servers_[2]->service_.ResetCounters();
-
   // Back to all servers.
+  gpr_log(GPR_INFO, "*** ALL BACKENDS ***");
   ports.clear();
   ports.emplace_back(servers_[0]->port_);
   ports.emplace_back(servers_[1]->port_);
@@ -971,14 +1061,13 @@ TEST_F(ClientLbEnd2endTest, RoundRobinUpdates) {
   WaitForServer(stub, 0, DEBUG_LOCATION);
   WaitForServer(stub, 1, DEBUG_LOCATION);
   WaitForServer(stub, 2, DEBUG_LOCATION);
-
   // Send three RPCs, one per server.
   for (size_t i = 0; i < 3; ++i) CheckRpcSendOk(stub, DEBUG_LOCATION);
   EXPECT_EQ(1, servers_[0]->service_.request_count());
   EXPECT_EQ(1, servers_[1]->service_.request_count());
   EXPECT_EQ(1, servers_[2]->service_.request_count());
-
   // An empty update will result in the channel going into TRANSIENT_FAILURE.
+  gpr_log(GPR_INFO, "*** NO BACKENDS ***");
   ports.clear();
   SetNextResolution(ports);
   grpc_connectivity_state channel_state;
@@ -987,15 +1076,14 @@ TEST_F(ClientLbEnd2endTest, RoundRobinUpdates) {
   } while (channel_state == GRPC_CHANNEL_READY);
   ASSERT_NE(channel_state, GRPC_CHANNEL_READY);
   servers_[0]->service_.ResetCounters();
-
   // Next update introduces servers_[1], making the channel recover.
+  gpr_log(GPR_INFO, "*** BACK TO SECOND BACKEND ***");
   ports.clear();
   ports.emplace_back(servers_[1]->port_);
   SetNextResolution(ports);
   WaitForServer(stub, 1, DEBUG_LOCATION);
   channel_state = channel->GetState(false /* try to connect */);
   ASSERT_EQ(channel_state, GRPC_CHANNEL_READY);
-
   // Check LB policy name for the channel.
   EXPECT_EQ("round_robin", channel->GetLoadBalancingPolicyName());
 }
@@ -1114,8 +1202,9 @@ TEST_F(ClientLbEnd2endTest, RoundRobinSingleReconnect) {
   auto channel = BuildChannel("round_robin");
   auto stub = BuildStub(channel);
   SetNextResolution(ports);
-  for (size_t i = 0; i < kNumServers; ++i)
+  for (size_t i = 0; i < kNumServers; ++i) {
     WaitForServer(stub, i, DEBUG_LOCATION);
+  }
   for (size_t i = 0; i < servers_.size(); ++i) {
     CheckRpcSendOk(stub, DEBUG_LOCATION);
     EXPECT_EQ(1, servers_[i]->service_.request_count()) << "for backend #" << i;
@@ -1139,7 +1228,6 @@ TEST_F(ClientLbEnd2endTest, RoundRobinSingleReconnect) {
   // No requests have gone to the deceased server.
   EXPECT_EQ(pre_death, post_death);
   // Bring the first server back up.
-  servers_[0].reset(new ServerData(ports[0]));
   StartServer(0);
   // Requests should start arriving at the first server either right away (if
   // the server managed to start before the RR policy retried the subchannel) or
@@ -1263,6 +1351,52 @@ TEST_F(ClientLbEnd2endTest, RoundRobinWithHealthCheckingInhibitPerChannel) {
   // Second channel should be READY.
   EXPECT_TRUE(WaitForChannelReady(channel2.get(), 1));
   CheckRpcSendOk(stub2, DEBUG_LOCATION);
+  // Enable health checks on the backend and wait for channel 1 to succeed.
+  servers_[0]->SetServingStatus("health_check_service_name", true);
+  CheckRpcSendOk(stub1, DEBUG_LOCATION, true /* wait_for_ready */);
+  // Check that we created only one subchannel to the backend.
+  EXPECT_EQ(1UL, servers_[0]->service_.clients().size());
+  // Clean up.
+  EnableDefaultHealthCheckService(false);
+}
+
+TEST_F(ClientLbEnd2endTest, RoundRobinWithHealthCheckingServiceNamePerChannel) {
+  EnableDefaultHealthCheckService(true);
+  // Start server.
+  const int kNumServers = 1;
+  StartServers(kNumServers);
+  // Create a channel with health-checking enabled.
+  ChannelArguments args;
+  args.SetServiceConfigJSON(
+      "{\"healthCheckConfig\": "
+      "{\"serviceName\": \"health_check_service_name\"}}");
+  auto channel1 = BuildChannel("round_robin", args);
+  auto stub1 = BuildStub(channel1);
+  std::vector<int> ports = GetServersPorts();
+  SetNextResolution(ports);
+  // Create a channel with health-checking enabled with a different
+  // service name.
+  ChannelArguments args2;
+  args2.SetServiceConfigJSON(
+      "{\"healthCheckConfig\": "
+      "{\"serviceName\": \"health_check_service_name2\"}}");
+  auto channel2 = BuildChannel("round_robin", args2);
+  auto stub2 = BuildStub(channel2);
+  SetNextResolution(ports);
+  // Allow health checks from channel 2 to succeed.
+  servers_[0]->SetServingStatus("health_check_service_name2", true);
+  // First channel should not become READY, because health checks should be
+  // failing.
+  EXPECT_FALSE(WaitForChannelReady(channel1.get(), 1));
+  CheckRpcSendFailure(stub1);
+  // Second channel should be READY.
+  EXPECT_TRUE(WaitForChannelReady(channel2.get(), 1));
+  CheckRpcSendOk(stub2, DEBUG_LOCATION);
+  // Enable health checks for channel 1 and wait for it to succeed.
+  servers_[0]->SetServingStatus("health_check_service_name", true);
+  CheckRpcSendOk(stub1, DEBUG_LOCATION, true /* wait_for_ready */);
+  // Check that we created only one subchannel to the backend.
+  EXPECT_EQ(1UL, servers_[0]->service_.clients().size());
   // Clean up.
   EnableDefaultHealthCheckService(false);
 }
@@ -1278,7 +1412,7 @@ class ClientLbInterceptTrailingMetadataTest : public ClientLbEnd2endTest {
   void TearDown() override { ClientLbEnd2endTest::TearDown(); }
 
   int trailers_intercepted() {
-    std::unique_lock<std::mutex> lock(mu_);
+    grpc::internal::MutexLock lock(&mu_);
     return trailers_intercepted_;
   }
 
@@ -1286,11 +1420,11 @@ class ClientLbInterceptTrailingMetadataTest : public ClientLbEnd2endTest {
   static void ReportTrailerIntercepted(void* arg) {
     ClientLbInterceptTrailingMetadataTest* self =
         static_cast<ClientLbInterceptTrailingMetadataTest*>(arg);
-    std::unique_lock<std::mutex> lock(self->mu_);
+    grpc::internal::MutexLock lock(&self->mu_);
     self->trailers_intercepted_++;
   }
 
-  std::mutex mu_;
+  grpc::internal::Mutex mu_;
   int trailers_intercepted_ = 0;
 };
 
@@ -1347,6 +1481,9 @@ TEST_F(ClientLbInterceptTrailingMetadataTest, InterceptsRetriesEnabled) {
 }  // namespace grpc
 
 int main(int argc, char** argv) {
+  // Make the backup poller poll very frequently in order to pick up
+  // updates from all the subchannels's FDs.
+  GPR_GLOBAL_CONFIG_SET(grpc_client_channel_backup_poll_interval_ms, 1);
   ::testing::InitGoogleTest(&argc, argv);
   grpc::testing::TestEnvironment env(argc, argv);
   const auto result = RUN_ALL_TESTS();

@@ -51,6 +51,7 @@ template <class RequestType, class ResponseType>
 class CallbackServerStreamingHandler;
 template <StatusCode code>
 class ErrorMethodHandler;
+class ExternalConnectionAcceptorImpl;
 template <class R>
 class DeserializeFuncType;
 class GrpcByteBufferPeer;
@@ -96,7 +97,7 @@ class ByteBuffer final {
   /// \a buf. Wrapper of core function grpc_byte_buffer_copy . This is not
   /// a deep copy; it is just a referencing. As a result, its performance is
   /// size-independent.
-  ByteBuffer(const ByteBuffer& buf);
+  ByteBuffer(const ByteBuffer& buf) : buffer_(nullptr) { operator=(buf); }
 
   ~ByteBuffer() {
     if (buffer_) {
@@ -107,7 +108,16 @@ class ByteBuffer final {
   /// Wrapper of core function grpc_byte_buffer_copy . This is not
   /// a deep copy; it is just a referencing. As a result, its performance is
   /// size-independent.
-  ByteBuffer& operator=(const ByteBuffer&);
+  ByteBuffer& operator=(const ByteBuffer& buf) {
+    if (this != &buf) {
+      Clear();  // first remove existing data
+    }
+    if (buf.buffer_) {
+      // then copy
+      buffer_ = g_core_codegen_interface->grpc_byte_buffer_copy(buf.buffer_);
+    }
+    return *this;
+  }
 
   /// Dump (read) the buffer contents into \a slices.
   Status Dump(std::vector<Slice>* slices) const;
@@ -176,6 +186,7 @@ class ByteBuffer final {
   friend class ProtoBufferReader;
   friend class ProtoBufferWriter;
   friend class internal::GrpcByteBufferPeer;
+  friend class internal::ExternalConnectionAcceptorImpl;
 
   grpc_byte_buffer* buffer_;
 
@@ -215,7 +226,7 @@ class SerializationTraits<ByteBuffer, void> {
                           bool* own_buffer) {
     *buffer = source;
     *own_buffer = true;
-    return Status::OK;
+    return g_core_codegen_interface->ok();
   }
 };
 

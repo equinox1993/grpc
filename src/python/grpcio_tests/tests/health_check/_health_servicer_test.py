@@ -176,6 +176,7 @@ class BaseWatchTests(object):
             self.assertTrue(response_queue1.empty())
             self.assertTrue(response_queue2.empty())
 
+        @unittest.skip("https://github.com/grpc/grpc/issues/18127")
         def test_cancelled_watch_removed_from_watch_list(self):
             request = health_pb2.HealthCheckRequest(service=_WATCH_SERVICE)
             response_queue = queue.Queue()
@@ -245,7 +246,7 @@ class HealthServicerTest(BaseWatchTests.WatchTests):
         resp = self._stub.Check(request)
         self.assertEqual(health_pb2.HealthCheckResponse.SERVING, resp.status)
 
-    def test_check_unknown_serivce(self):
+    def test_check_unknown_service(self):
         request = health_pb2.HealthCheckRequest(service=_UNKNOWN_SERVICE)
         resp = self._stub.Check(request)
         self.assertEqual(health_pb2.HealthCheckResponse.UNKNOWN, resp.status)

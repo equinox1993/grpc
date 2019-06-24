@@ -28,7 +28,6 @@
 #include <grpc/support/alloc.h>
 #include <grpc/support/log.h>
 
-#include "src/core/lib/gpr/env.h"
 #include "src/core/lib/gpr/string.h"
 #include "src/core/lib/gpr/useful.h"
 #include "src/core/lib/surface/init.h"
@@ -382,13 +381,6 @@ gpr_timespec grpc_timeout_milliseconds_to_deadline(int64_t time_ms) {
 
 void grpc_test_init(int argc, char** argv) {
   install_crash_handler();
-  { /* poll-cv poll strategy runs much more slowly than anything else */
-    char* s = gpr_getenv("GRPC_POLL_STRATEGY");
-    if (s != nullptr && 0 == strcmp(s, "poll-cv")) {
-      g_poller_slowdown_factor = 5;
-    }
-    gpr_free(s);
-  }
   gpr_log(GPR_DEBUG,
           "test slowdown factor: sanitizer=%" PRId64 ", fixture=%" PRId64
           ", poller=%" PRId64 ", total=%" PRId64,
